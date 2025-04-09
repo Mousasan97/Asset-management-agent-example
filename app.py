@@ -74,9 +74,9 @@ def log_response_info(response):
 def retrieve_all_activities(limit=3, portfolio_name=None, request_id=None):
     log_extra = {'request_id': request_id or getattr(g, 'request_id', 'N/A')}
     try:
-        API_URL = "https://eurac.goantares.uno/public/api/v1/Activities"
-        AUTH_KEY = "b069c270-9622-478d-8bb2-6778a3d953f6"
-        AUTH_SECRET = "b57853f8-346b-4cf0-923d-30020705a784"
+        API_URL = os.getenv('ACTIVITIES_API_URL', 'https://eurac.goantares.uno/public/api/v1/Activities')
+        AUTH_KEY = os.getenv('AUTH_KEY')
+        AUTH_SECRET = os.getenv('AUTH_SECRET')
 
         headers = {"accept": "application/json"}
         auth = HTTPBasicAuth(AUTH_KEY, AUTH_SECRET)
@@ -120,9 +120,9 @@ def retrieve_assets_by_type(short_description, request_id=None):
     log_extra = {'request_id': request_id or getattr(g, 'request_id', 'N/A')}
     try:
         # API endpoint and credentials
-        API_URL = "https://eurac.goantares.uno/public/api/v3/Assets"
-        AUTH_KEY = "b069c270-9622-478d-8bb2-6778a3d953f6"
-        AUTH_SECRET = "b57853f8-346b-4cf0-923d-30020705a784"
+        API_URL = os.getenv('API_URL', 'https://eurac.goantares.uno/public/api/v3/Assets')
+        AUTH_KEY = os.getenv('AUTH_KEY')
+        AUTH_SECRET = os.getenv('AUTH_SECRET')
         
         # Set up headers and authentication
         headers = {"accept": "application/json"}
