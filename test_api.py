@@ -1,6 +1,16 @@
 import requests
 from requests.auth import HTTPBasicAuth
 import json
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Get API credentials from environment variables
+API_URL = os.getenv('API_URL', 'https://eurac.goantares.uno/public/api/v3/Assets')
+AUTH_KEY = os.getenv('AUTH_KEY')
+AUTH_SECRET = os.getenv('AUTH_SECRET')
 
 def test_activities_api():
     print("Testing Activities API...")
