@@ -11,6 +11,12 @@ import time
 import uuid
 from flask_cors import CORS
 import traceback # For detailed error logging
+from functools import lru_cache
+from datetime import datetime, timedelta
+
+# Cache configuration
+CACHE_TIMEOUT = 300  # 5 minutes cache timeout
+API_TIMEOUT = 5  # 5 seconds API timeout
 
 # Set up logging
 log_dir = 'logs'
@@ -71,6 +77,16 @@ def log_response_info(response):
     )
     return response
 
+# Cache decorator for API responses
+def cache_response(timeout=CACHE_TIMEOUT):
+    def decorator(func):
+        @lru_cache(maxsize=100)
+        def cached_func(*args, **kwargs):
+            return func(*args, **kwargs)
+        return cached_func
+    return decorator
+
+@cache_response()
 def retrieve_all_activities(limit=3, portfolio_name=None, request_id=None):
     log_extra = {'request_id': request_id or getattr(g, 'request_id', 'N/A')}
     try:
@@ -90,7 +106,7 @@ def retrieve_all_activities(limit=3, portfolio_name=None, request_id=None):
         params = {k: v for k, v in params.items() if v is not None}
 
         logger.info(f"Making API request to {API_URL} with params: {params}", extra=log_extra)
-        response = requests.get(API_URL, headers=headers, params=params, auth=auth, timeout=15)
+        response = requests.get(API_URL, headers=headers, params=params, auth=auth, timeout=API_TIMEOUT)
 
         if response.status_code == 200:
             data = response.json()
@@ -116,32 +132,27 @@ def retrieve_all_activities(limit=3, portfolio_name=None, request_id=None):
         logger.error(error_msg, exc_info=True, extra=log_extra)
         return {"error": error_msg}
 
+@cache_response()
 def retrieve_assets_by_type(short_description, request_id=None):
     log_extra = {'request_id': request_id or getattr(g, 'request_id', 'N/A')}
     try:
-        # API endpoint and credentials
         API_URL = os.getenv('API_URL', 'https://eurac.goantares.uno/public/api/v3/Assets')
         AUTH_KEY = os.getenv('AUTH_KEY')
         AUTH_SECRET = os.getenv('AUTH_SECRET')
         
-        # Set up headers and authentication
         headers = {"accept": "application/json"}
         auth = HTTPBasicAuth(AUTH_KEY, AUTH_SECRET)
         
-        # Set up parameters including filter for ShortDescription
         params = {
             "$filter": f"ShortDescription eq '{short_description}'",
-            "$top": 1000  # Increased to get all matching items
+            "$top": 1000
         }
 
         logger.info(f"Making API request to {API_URL} with params: {params}", extra=log_extra)
-        # Make the API request
-        response = requests.get(API_URL, headers=headers, params=params, auth=auth, timeout=15)
+        response = requests.get(API_URL, headers=headers, params=params, auth=auth, timeout=API_TIMEOUT)
         
         if response.status_code == 200:
             data = response.json()
-            
-            # Extract only the needed fields
             filtered_data = []
             for asset in data:
                 filtered_asset = {
@@ -167,14 +178,17 @@ def retrieve_assets_by_type(short_description, request_id=None):
             
     except Exception as e:
         error_msg = f"Error retrieving assets: {str(e)}"
-        logger.error(error_msg, exc_info=True, extra=log_extra)  # This will log the full stack trace
+        logger.error(error_msg, exc_info=True, extra=log_extra)
         return {"error": error_msg}
 
 # Initialize or get existing assistant
 def get_or_create_assistant():
-    # For simplicity, we create a new one each time.
-    # In production, you might want to retrieve an existing one by ID.
     try:
+        # Check if we have a valid API key
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key or api_key == 'your_openai_api_key_here':
+            raise ValueError("Invalid or missing OpenAI API key. Please set a valid API key in your .env file.")
+
         assistant = client.beta.assistants.create(
             name="Data Retriever V2",
             instructions="""You are a data retrieval agent for an asset management system. Your role is to retrieve data based on the user query.
@@ -198,23 +212,23 @@ def get_or_create_assistant():
                     "name": "retrieve_assets_by_type",
                     "description": "Get assets by their short description type",
                     "parameters": {"type": "object", "properties": {
-                        "short_description": {"type": "string", "description": "Asset type"}
-                    }, "required": ["short_description"]}}},
+                        "short_description": {"type": "string", "description": "The short description to filter assets by"}
+                    }, "required": ["short_description"]}}
+                },
                 {"type": "function", "function": {
                     "name": "retrieve_all_activities",
-                    "description": "Get recent asset activities",
+                    "description": "Get recent activities with optional filtering",
                     "parameters": {"type": "object", "properties": {
-                        "limit": {"type": "integer", "description": "Number (default: 3)"},
-                        "portfolio_name": {"type": "string", "description": "Optional portfolio"}
-                    }, "required": ["limit"]}}}
+                        "limit": {"type": "integer", "description": "Number of activities to retrieve (default: 3)"},
+                        "portfolio_name": {"type": "string", "description": "Optional portfolio name to filter by"}
+                    }, "required": []}}
+                }
             ]
         )
         return assistant
     except Exception as e:
-        # Print the error during startup, as logger might not be fully usable here
-        print(f"CRITICAL: Failed to create OpenAI Assistant during startup: {e}") 
-        traceback.print_exc() # Print the full traceback
-        raise # Re-raise the exception to stop the app
+        logger.error(f"Failed to create OpenAI Assistant during startup: {str(e)}", exc_info=True)
+        raise
 
 assistant = get_or_create_assistant()
 
@@ -424,4 +438,6 @@ def handle_tool_calls(run, thread_id, request_id):
     return False # No tool calls required or handled
 
 if __name__ == '__main__':
-    app.run(debug=True) 
+    app.run(debug=True)
+    
+     
