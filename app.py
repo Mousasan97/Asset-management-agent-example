@@ -189,6 +189,19 @@ def get_or_create_assistant():
         if not api_key or api_key == 'your_openai_api_key_here':
             raise ValueError("Invalid or missing OpenAI API key. Please set a valid API key in your .env file.")
 
+        # Try to get existing assistant by ID
+        assistant_id = os.getenv('OPENAI_ASSISTANT_ID')
+        if assistant_id:
+            try:
+                logger.info(f"Retrieving existing assistant with ID: {assistant_id}")
+                assistant = client.beta.assistants.retrieve(assistant_id)
+                logger.info("Successfully retrieved existing assistant")
+                return assistant
+            except Exception as e:
+                logger.warning(f"Failed to retrieve existing assistant: {str(e)}. Creating new one...")
+
+        # If no assistant_id or retrieval failed, create new assistant
+        logger.info("Creating new assistant...")
         assistant = client.beta.assistants.create(
             name="Data Retriever V2",
             instructions="""You are a data retrieval agent for an asset management system. Your role is to retrieve data based on the user query.
@@ -225,6 +238,11 @@ def get_or_create_assistant():
                 }
             ]
         )
+        
+        # Log the new assistant ID for future use
+        logger.info(f"Created new assistant with ID: {assistant.id}")
+        logger.info("Please add this ID to your .env file as OPENAI_ASSISTANT_ID")
+        
         return assistant
     except Exception as e:
         logger.error(f"Failed to create OpenAI Assistant during startup: {str(e)}", exc_info=True)
