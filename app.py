@@ -13,10 +13,14 @@ from flask_cors import CORS
 import traceback # For detailed error logging
 from functools import lru_cache
 from datetime import datetime, timedelta
+import threading
+import queue
 
 # Cache configuration
 CACHE_TIMEOUT = 300  # 5 minutes cache timeout
 API_TIMEOUT = 5  # 5 seconds API timeout
+POLLING_INTERVAL = 0.5  # 500ms polling interval
+MAX_POLLING_TIME = 30  # Maximum time to poll for a response (seconds)
 
 # Set up logging
 log_dir = 'logs'
@@ -48,7 +52,11 @@ logger.addHandler(console_handler)
 # Request ID context
 class RequestIdFilter(logging.Filter):
     def filter(self, record):
-        record.request_id = getattr(g, 'request_id', 'N/A')
+        try:
+            record.request_id = getattr(g, 'request_id', 'N/A')
+        except Exception:
+            # If we're outside of application context, just use N/A
+            record.request_id = 'N/A'
         return True
 
 logger.addFilter(RequestIdFilter())
@@ -58,6 +66,9 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 client = OpenAI()
+
+# Create a queue for storing run results
+run_results = {}
 
 @app.before_request
 def log_request_info():
@@ -194,91 +205,149 @@ def get_or_create_assistant():
         if assistant_id:
             try:
                 logger.info(f"Retrieving existing assistant with ID: {assistant_id}")
-                assistant = client.beta.assistants.retrieve(assistant_id)
-                logger.info("Successfully retrieved existing assistant")
-                return assistant
+                with app.app_context():
+                    assistant = client.beta.assistants.retrieve(assistant_id)
+                    logger.info("Successfully retrieved existing assistant")
+                    return assistant
             except Exception as e:
                 logger.warning(f"Failed to retrieve existing assistant: {str(e)}. Creating new one...")
 
         # If no assistant_id or retrieval failed, create new assistant
         logger.info("Creating new assistant...")
-        assistant = client.beta.assistants.create(
-            name="Data Retriever V2",
-            instructions="""You are a data retrieval agent for an asset management system. Your role is to retrieve data based on the user query.
-        
-            When asked about assets:
-            - Use retrieve_assets_by_type to get asset information
-            - Assets have fields: SecondaryCode, ShortDescription, Model, ExternalManufacturer, and Coordinates
-            - Provide clear summaries of the assets found
+        with app.app_context():
+            assistant = client.beta.assistants.create(
+                name="Data Retriever V2",
+                instructions="""You are a data retrieval agent for an asset management system. Your role is to retrieve data based on the user query.
             
-            When asked about activities:
-            - Use retrieve_all_activities to get recent activities
-            - If no limit is specified, use a default of 3
-            - Activities are ordered by creation date
-            - You can filter activities by portfolio name if specified
+                When asked about assets:
+                - Use retrieve_assets_by_type to get asset information
+                - Assets have fields: SecondaryCode, ShortDescription, Model, ExternalManufacturer, and Coordinates
+                - Provide clear summaries of the assets found
+                
+                When asked about activities:
+                - Use retrieve_all_activities to get recent activities
+                - If no limit is specified, use a default of 3
+                - Activities are ordered by creation date
+                - You can filter activities by portfolio name if specified
+                
+                Be specific in your responses and include relevant details from the data retrieved.
+                If there's an error in data retrieval, explain it clearly to the user.""",
+                model="gpt-4",
+                tools=[
+                    {"type": "function", "function": {
+                        "name": "retrieve_assets_by_type",
+                        "description": "Get assets by their short description type",
+                        "parameters": {"type": "object", "properties": {
+                            "short_description": {"type": "string", "description": "The short description to filter assets by"}
+                        }, "required": ["short_description"]}}
+                    },
+                    {"type": "function", "function": {
+                        "name": "retrieve_all_activities",
+                        "description": "Get recent activities with optional filtering",
+                        "parameters": {"type": "object", "properties": {
+                            "limit": {"type": "integer", "description": "Number of activities to retrieve (default: 3)"},
+                            "portfolio_name": {"type": "string", "description": "Optional portfolio name to filter by"}
+                        }, "required": []}}
+                    }
+                ]
+            )
             
-            Be specific in your responses and include relevant details from the data retrieved.
-            If there's an error in data retrieval, explain it clearly to the user.""",
-            model="gpt-4",
-            tools=[
-                {"type": "function", "function": {
-                    "name": "retrieve_assets_by_type",
-                    "description": "Get assets by their short description type",
-                    "parameters": {"type": "object", "properties": {
-                        "short_description": {"type": "string", "description": "The short description to filter assets by"}
-                    }, "required": ["short_description"]}}
-                },
-                {"type": "function", "function": {
-                    "name": "retrieve_all_activities",
-                    "description": "Get recent activities with optional filtering",
-                    "parameters": {"type": "object", "properties": {
-                        "limit": {"type": "integer", "description": "Number of activities to retrieve (default: 3)"},
-                        "portfolio_name": {"type": "string", "description": "Optional portfolio name to filter by"}
-                    }, "required": []}}
-                }
-            ]
-        )
-        
-        # Log the new assistant ID for future use
-        logger.info(f"Created new assistant with ID: {assistant.id}")
-        logger.info("Please add this ID to your .env file as OPENAI_ASSISTANT_ID")
-        
-        return assistant
+            # Log the new assistant ID for future use
+            logger.info(f"Created new assistant with ID: {assistant.id}")
+            logger.info("Please add this ID to your .env file as OPENAI_ASSISTANT_ID")
+            
+            return assistant
     except Exception as e:
         logger.error(f"Failed to create OpenAI Assistant during startup: {str(e)}", exc_info=True)
         raise
 
-assistant = get_or_create_assistant()
+# Create the assistant at startup
+with app.app_context():
+    assistant = get_or_create_assistant()
 
 @app.route('/')
 def home():
     return render_template('index.html')
 
-@app.route('/api/chat/start', methods=['POST', 'OPTIONS'])
-def start_chat():
-    # Handles CORS preflight request
-    if request.method == 'OPTIONS':
-        response = app.make_default_options_response()
-        # Allow necessary headers for CORS
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Accept')
-        return response
+# Function to poll for run completion in a separate thread
+def poll_run_completion(thread_id, run_id, request_id):
+    log_extra = {'request_id': request_id}
+    start_time = time.time()
+    
+    while time.time() - start_time < MAX_POLLING_TIME:
+        try:
+            run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+            
+            if run.status == 'completed':
+                logger.info(f"Run {run.id} completed. Retrieving messages...", extra=log_extra)
+                messages = client.beta.threads.messages.list(thread_id=thread_id, order='desc', limit=1)
+                assistant_message = "No response found."
+                
+                for msg in messages.data:
+                    if msg.role == 'assistant':
+                        if msg.content and msg.content[0].type == 'text':
+                            assistant_message = msg.content[0].text.value
+                            break
+                
+                logger.info(f"Final assistant message retrieved.", extra=log_extra)
+                run_results[run_id] = {
+                    'status': 'completed',
+                    'response': assistant_message,
+                    'thread_id': thread_id
+                }
+                return
+                
+            elif run.status == 'requires_action':
+                logger.info(f"Run {run.id} requires tool action.", extra=log_extra)
+                handle_tool_calls(run, thread_id, request_id)
+                # Continue polling after handling tool calls
+                
+            elif run.status in ['queued', 'in_progress']:
+                logger.debug(f"Run {run.id} is {run.status}.", extra=log_extra)
+                time.sleep(POLLING_INTERVAL)
+                
+            elif run.status in ['cancelling', 'cancelled', 'failed', 'expired']:
+                error_message = f"Run {run.id} ended with status: {run.status}"
+                if run.last_error:
+                    error_message += f" - Error: {run.last_error.code}: {run.last_error.message}"
+                logger.error(error_message, extra=log_extra)
+                run_results[run_id] = {
+                    'status': 'failed',
+                    'error': error_message,
+                    'run_status': run.status
+                }
+                return
+                
+        except Exception as e:
+            logger.error(f"Error polling run status: {str(e)}", exc_info=True, extra=log_extra)
+            run_results[run_id] = {
+                'status': 'failed',
+                'error': f"Error polling run status: {str(e)}"
+            }
+            return
+            
+        time.sleep(POLLING_INTERVAL)
+    
+    # If we've reached the maximum polling time
+    logger.warning(f"Run {run_id} timed out after {MAX_POLLING_TIME} seconds", extra=log_extra)
+    run_results[run_id] = {
+        'status': 'timeout',
+        'error': f"Run timed out after {MAX_POLLING_TIME} seconds"
+    }
 
-    # Use request_id generated by before_request hook
+@app.route('/api/chat/start', methods=['POST'])
+def start_chat():
     request_id = getattr(g, 'request_id', 'N/A')
     log_extra = {'request_id': request_id}
-
+    
     try:
         data = request.get_json()
-        if not data:
-            logger.error("No JSON data in request", extra=log_extra)
-            return jsonify({'error': 'No data provided', 'status': 'error'}), 400
-
-        message_content = data.get('message')
+        message_content = data.get('message', '')
+        thread_id = data.get('thread_id')
+        
         if not message_content:
-            logger.error("No message provided in request", extra=log_extra)
-            return jsonify({'error': 'No message provided', 'status': 'error'}), 400
-
-        thread_id = data.get('thread_id') # Can be None for first message
+            logger.error("No message content provided", extra=log_extra)
+            return jsonify({'error': 'No message content provided', 'status': 'error'}), 400
 
         # 1. Get or Create Thread
         if not thread_id:
@@ -287,18 +356,7 @@ def start_chat():
             thread_id = thread.id
             logger.info(f"New thread created: {thread_id}", extra=log_extra)
         else:
-            # Optional: Validate thread_id exists? For simplicity, assume valid if provided.
             logger.info(f"Using existing thread: {thread_id}", extra=log_extra)
-            # Optional: Cancel any existing runs on this thread? Might be useful.
-            # try:
-            #     runs = client.beta.threads.runs.list(thread_id=thread_id, limit=10)
-            #     for run in runs.data:
-            #         if run.status in ['queued', 'in_progress', 'requires_action']:
-            #             client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
-            #             logger.warning(f"Cancelled previous run {run.id} on thread {thread_id}", extra=log_extra)
-            # except Exception as cancel_e:
-            #     logger.error(f"Error cancelling previous runs for thread {thread_id}: {cancel_e}", extra=log_extra)
-
 
         # 2. Add Message to Thread
         logger.info(f"Adding message to thread {thread_id}: {message_content}", extra=log_extra)
@@ -313,16 +371,23 @@ def start_chat():
         run = client.beta.threads.runs.create(
             thread_id=thread_id,
             assistant_id=assistant.id
-            # instructions="Optional override for this run" # Example
         )
         logger.info(f"Run created: {run.id} with status: {run.status}", extra=log_extra)
+        
+        # 4. Start polling in a separate thread
+        polling_thread = threading.Thread(
+            target=poll_run_completion,
+            args=(thread_id, run.id, request_id)
+        )
+        polling_thread.daemon = True
+        polling_thread.start()
 
-        # 4. Return Run ID and Thread ID Immediately
+        # 5. Return Run ID and Thread ID Immediately
         return jsonify({
             'run_id': run.id,
             'thread_id': thread_id,
-            'status': 'started' # Indicate the process has started
-        }), 202 # Accepted: request accepted, processing will occur
+            'status': 'started'
+        }), 202
 
     except Exception as e:
         error_msg = f"Error starting chat run: {str(e)}\n{traceback.format_exc()}"
@@ -331,7 +396,6 @@ def start_chat():
 
 @app.route('/api/chat/status/<run_id>', methods=['GET'])
 def get_chat_status(run_id):
-    # Use request_id generated by before_request hook
     request_id = getattr(g, 'request_id', 'N/A')
     log_extra = {'request_id': request_id}
 
@@ -342,61 +406,15 @@ def get_chat_status(run_id):
 
     logger.info(f"Checking status for run_id: {run_id}, thread_id: {thread_id}", extra=log_extra)
 
-    try:
-        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
-        logger.debug(f"Retrieved run status: {run.status}", extra=log_extra)
-
-        if run.status == 'completed':
-            logger.info(f"Run {run.id} completed. Retrieving messages...", extra=log_extra)
-            messages = client.beta.threads.messages.list(thread_id=thread_id, order='desc', limit=1) # Get newest message
-            assistant_message = "No response found."
-            # Find the latest assistant message in the retrieved batch
-            for msg in messages.data:
-                 if msg.role == 'assistant':
-                    if msg.content and msg.content[0].type == 'text':
-                         assistant_message = msg.content[0].text.value
-                         break # Found the latest assistant message
-
-            logger.info(f"Final assistant message retrieved.", extra=log_extra)
-            return jsonify({
-                'status': 'completed',
-                'response': assistant_message,
-                'thread_id': thread_id # Return thread_id for consistency
-            })
-
-        elif run.status == 'requires_action':
-            logger.info(f"Run {run.id} requires tool action.", extra=log_extra)
-            # Handle tool calls synchronously for now. This GET request might take longer.
-            handle_tool_calls(run, thread_id, request_id)
-            # After handling (or attempting to handle), tell the frontend to keep polling
-            return jsonify({'status': 'processing_tools'})
-
-        elif run.status in ['queued', 'in_progress']:
-            logger.debug(f"Run {run.id} is {run.status}.", extra=log_extra)
-            return jsonify({'status': 'processing'})
-
-        elif run.status in ['cancelling', 'cancelled', 'failed', 'expired']:
-            error_message = f"Run {run.id} ended with status: {run.status}"
-            if run.last_error:
-                error_message += f" - Error: {run.last_error.code}: {run.last_error.message}"
-            logger.error(error_message, extra=log_extra)
-            return jsonify({
-                'status': 'failed',
-                'error': error_message,
-                'run_status': run.status # Provide specific final status
-            }), 500 # Internal Server Error might be appropriate for failed runs
-        
-        else: # Unknown status
-             logger.warning(f"Run {run.id} has unknown status: {run.status}", extra=log_extra)
-             return jsonify({'status': run.status}) # Return the unknown status
-
-    except openai.NotFoundError:
-         logger.error(f"Run not found - run_id: {run_id}, thread_id: {thread_id}", extra=log_extra)
-         return jsonify({'error': 'Run or Thread not found', 'status': 'error'}), 404
-    except Exception as e:
-        error_msg = f"Error checking run status: {str(e)}\n{traceback.format_exc()}"
-        logger.error(error_msg, exc_info=True, extra=log_extra)
-        return jsonify({'error': f"Internal Server Error: {str(e)}", 'status': 'error'}), 500
+    # Check if we have a result for this run
+    if run_id in run_results:
+        result = run_results[run_id]
+        # Remove the result from the queue to free up memory
+        del run_results[run_id]
+        return jsonify(result)
+    
+    # If no result yet, return processing status
+    return jsonify({'status': 'processing'})
 
 def handle_tool_calls(run, thread_id, request_id):
     log_extra = {'request_id': request_id or getattr(g, 'request_id', 'N/A')}
