@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, jsonify, g
-from openai import OpenAI
+from openai import AzureOpenAI
 import json
 import os
 import logging
@@ -15,6 +15,7 @@ from functools import lru_cache
 from datetime import datetime, timedelta
 import threading
 import queue
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 # Cache configuration
 CACHE_TIMEOUT = 300  # 5 minutes cache timeout
@@ -65,7 +66,18 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
-client = OpenAI()
+
+# Initialize Azure OpenAI client with API key authentication
+try:
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_version="2024-05-01-preview"
+    )
+    logger.info("Successfully initialized Azure OpenAI client")
+except Exception as e:
+    logger.error(f"Failed to initialize Azure OpenAI client: {str(e)}", exc_info=True)
+    raise
 
 # Create a queue for storing run results
 run_results = {}
@@ -195,13 +207,13 @@ def retrieve_assets_by_type(short_description, request_id=None):
 # Initialize or get existing assistant
 def get_or_create_assistant():
     try:
-        # Check if we have a valid API key
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key or api_key == 'your_openai_api_key_here':
-            raise ValueError("Invalid or missing OpenAI API key. Please set a valid API key in your .env file.")
+        # Check if we have a valid Azure OpenAI endpoint
+        azure_endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
+        if not azure_endpoint:
+            raise ValueError("Invalid or missing Azure OpenAI endpoint. Please set a valid endpoint in your .env file.")
 
         # Try to get existing assistant by ID
-        assistant_id = os.getenv('OPENAI_ASSISTANT_ID')
+        assistant_id = os.getenv('AZURE_ASSISTANT_ID')
         if assistant_id:
             try:
                 logger.info(f"Retrieving existing assistant with ID: {assistant_id}")
@@ -216,49 +228,30 @@ def get_or_create_assistant():
         logger.info("Creating new assistant...")
         with app.app_context():
             assistant = client.beta.assistants.create(
-                name="Data Retriever V2",
-                instructions="""You are a data retrieval agent for an asset management system. Your role is to retrieve data based on the user query.
-            
-                When asked about assets:
-                - Use retrieve_assets_by_type to get asset information
-                - Assets have fields: SecondaryCode, ShortDescription, Model, ExternalManufacturer, and Coordinates
-                - Provide clear summaries of the assets found
-                
-                When asked about activities:
-                - Use retrieve_all_activities to get recent activities
-                - If no limit is specified, use a default of 3
-                - Activities are ordered by creation date
-                - You can filter activities by portfolio name if specified
-                
-                Be specific in your responses and include relevant details from the data retrieved.
-                If there's an error in data retrieval, explain it clearly to the user.""",
-                model="gpt-4",
+                model="gpt-4o",  # replace with model deployment name
+                name="Asset management agent",
+                instructions="""You are a data retrieval agent, having access to an Antares platform, your role is to retrieve the data based on the user query. The data you 
+                have access to is:
+                -Retrieve assets based on the asset name.
+                -Retrieve activities
+                """,
                 tools=[
-                    {"type": "function", "function": {
-                        "name": "retrieve_assets_by_type",
-                        "description": "Get assets by their short description type",
-                        "parameters": {"type": "object", "properties": {
-                            "short_description": {"type": "string", "description": "The short description to filter assets by"}
-                        }, "required": ["short_description"]}}
-                    },
-                    {"type": "function", "function": {
-                        "name": "retrieve_all_activities",
-                        "description": "Get recent activities with optional filtering",
-                        "parameters": {"type": "object", "properties": {
-                            "limit": {"type": "integer", "description": "Number of activities to retrieve (default: 3)"},
-                            "portfolio_name": {"type": "string", "description": "Optional portfolio name to filter by"}
-                        }, "required": []}}
-                    }
-                ]
+                    {"type":"file_search"},
+                    {"type":"function","function":{"name":"retrieve_assets_by_type","description":"Retrieves the available assets by the type of the asset, while reading from Antares platform","parameters":{"type":"object","properties":{"short_description":{"type":"string","description":"The type of the asset to retrieve"}},"required":["short_description"]}}},
+                    {"type":"function","function":{"name":"retrieve_all_activities","description":"Retrieves the most recent n activities on assets while reading from Antares platform","parameters":{"type":"object","properties":{"limit":{"type":"string","description":"The number of activities to retrieve"}},"required":["limit"]}}}
+                ],
+                tool_resources={"file_search":{"vector_store_ids":[]}},
+                temperature=1,
+                top_p=1
             )
             
             # Log the new assistant ID for future use
             logger.info(f"Created new assistant with ID: {assistant.id}")
-            logger.info("Please add this ID to your .env file as OPENAI_ASSISTANT_ID")
+            logger.info("Please add this ID to your .env file as AZURE_ASSISTANT_ID")
             
             return assistant
     except Exception as e:
-        logger.error(f"Failed to create OpenAI Assistant during startup: {str(e)}", exc_info=True)
+        logger.error(f"Failed to create Azure OpenAI Assistant during startup: {str(e)}", exc_info=True)
         raise
 
 # Create the assistant at startup
